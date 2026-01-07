@@ -208,6 +208,7 @@ __marimo__/
 
 # Custom ignores
 .ig-*
+mcp_multiturn_log.jsonl
 
 # Node.js / npm / JavaScript
 node_modules/

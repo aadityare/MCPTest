@@ -7,6 +7,7 @@ import time
 import uuid
 import urllib.parse
 from typing import Any, Dict, List
+import argparse
 
 try:
     from openai import OpenAI
@@ -19,6 +20,12 @@ try:
     OLLAMA_AVAILABLE = True
 except ImportError:
     OLLAMA_AVAILABLE = False
+
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -43,24 +50,64 @@ PAYPAL_DRY_RUN = (PAYPAL_ACCESS_TOKEN.strip() == "")
 # Ollama fallback settings
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+# Gemini settings
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-exp")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # -----------------------------
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='MCP Host with multiple LLM providers')
+parser.add_argument('--provider', choices=['openai', 'gemini', 'ollama'], help='LLM provider to use')
+args = parser.parse_args()
 
 # Determine which client to use
 USE_OLLAMA = False
+USE_GEMINI = False
 client = None
 
-if not OPENAI_AVAILABLE or not os.environ.get("OPENAI_API_KEY"):
+if args.provider == 'openai':
+    if OPENAI_AVAILABLE and os.environ.get("OPENAI_API_KEY"):
+        client = OpenAI()
+        print(f"[INFO] Using OpenAI with model: {MODEL}")
+    else:
+        print("Error: OpenAI requested but not available or no API key set")
+        sys.exit(1)
+elif args.provider == 'gemini':
+    if GEMINI_AVAILABLE and GEMINI_API_KEY:
+        USE_GEMINI = True
+        MODEL = GEMINI_MODEL
+        genai.configure(api_key=GEMINI_API_KEY)
+        print(f"[INFO] Using Gemini with model: {MODEL}")
+    else:
+        print("Error: Gemini requested but not available or no API key set")
+        sys.exit(1)
+elif args.provider == 'ollama':
     if OLLAMA_AVAILABLE:
         USE_OLLAMA = True
         MODEL = OLLAMA_MODEL
         print(f"[INFO] Using Ollama with model: {MODEL}")
     else:
-        print("Error: Neither OpenAI nor Ollama is available.")
-        print("Install one: pip install openai  OR  pip install ollama")
+        print("Error: Ollama requested but not available")
         sys.exit(1)
 else:
-    client = OpenAI()
-    print(f"[INFO] Using OpenAI with model: {MODEL}")
+    # Auto-fallback: OpenAI > Gemini > Ollama
+    if OPENAI_AVAILABLE and os.environ.get("OPENAI_API_KEY"):
+        client = OpenAI()
+        print(f"[INFO] Using OpenAI with model: {MODEL}")
+    elif GEMINI_AVAILABLE and GEMINI_API_KEY:
+        USE_GEMINI = True
+        MODEL = GEMINI_MODEL
+        genai.configure(api_key=GEMINI_API_KEY)
+        print(f"[INFO] Using Gemini with model: {MODEL}")
+    elif OLLAMA_AVAILABLE:
+        USE_OLLAMA = True
+        MODEL = OLLAMA_MODEL
+        print(f"[INFO] Using Ollama with model: {MODEL}")
+    else:
+        print("Error: No LLM provider available.")
+        print("Install one: pip install openai  OR  pip install google-generativeai  OR  pip install ollama")
+        sys.exit(1)
 
 
 def log_event(event: Dict[str, Any]):
@@ -95,8 +142,52 @@ def extract_urls(text: str, limit: int = 10) -> List[str]:
 
 
 def call_llm_with_tools(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Any:
-    """Call LLM (OpenAI or Ollama) with tool support."""
-    if USE_OLLAMA:
+    """Call LLM (OpenAI, Gemini, or Ollama) with tool support."""
+    if USE_GEMINI:
+        # Convert to Gemini format
+        gemini_tools = []
+        for tool in tools:
+            gemini_tools.append(genai.protos.Tool(
+                function_declarations=[
+                    genai.protos.FunctionDeclaration(
+                        name=tool["name"],
+                        description=tool["description"],
+                        parameters=genai.protos.Schema(
+                            type=genai.protos.Type.OBJECT,
+                            properties={
+                                k: genai.protos.Schema(type=genai.protos.Type.STRING if v["type"] == "string" else genai.protos.Type.NUMBER)
+                                for k, v in tool["parameters"]["properties"].items()
+                            },
+                            required=tool["parameters"].get("required", [])
+                        )
+                    )
+                ]
+            ))
+        
+        model = genai.GenerativeModel(MODEL, tools=gemini_tools)
+        
+        # Convert messages to Gemini format
+        gemini_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                continue  # Gemini doesn't have system role, prepend to first user message
+            elif msg["role"] == "user":
+                gemini_messages.append({"role": "user", "parts": [msg["content"]]})
+            elif msg["role"] == "assistant":
+                gemini_messages.append({"role": "model", "parts": [msg["content"]]})
+            elif msg["role"] == "tool":
+                gemini_messages.append({"role": "function", "parts": [msg["content"]]})
+        
+        # Prepend system message to first user message if exists
+        system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
+        if system_msg and gemini_messages:
+            gemini_messages[0]["parts"][0] = system_msg + "\n\n" + gemini_messages[0]["parts"][0]
+        
+        chat = model.start_chat(history=gemini_messages[:-1] if len(gemini_messages) > 1 else [])
+        response = chat.send_message(gemini_messages[-1]["parts"][0] if gemini_messages else "")
+        
+        return response
+    elif USE_OLLAMA:
         # Convert OpenAI tool format to Ollama format
         ollama_tools = []
         for tool in tools:
@@ -126,8 +217,15 @@ def call_llm_with_tools(messages: List[Dict[str, Any]], tools: List[Dict[str, An
 
 
 def extract_tool_calls(response: Any) -> List[Any]:
-    """Extract tool calls from LLM response (works for both OpenAI and Ollama)."""
-    if USE_OLLAMA:
+    """Extract tool calls from LLM response (works for OpenAI, Gemini, and Ollama)."""
+    if USE_GEMINI:
+        # Gemini format
+        tool_calls = []
+        for part in response.parts:
+            if hasattr(part, 'function_call'):
+                tool_calls.append(part.function_call)
+        return tool_calls
+    elif USE_OLLAMA:
         # Ollama format
         message = response.get("message", {})
         tool_calls = message.get("tool_calls", [])
@@ -139,7 +237,13 @@ def extract_tool_calls(response: Any) -> List[Any]:
 
 def get_assistant_text(response: Any) -> str:
     """Get assistant text from response."""
-    if USE_OLLAMA:
+    if USE_GEMINI:
+        text_parts = []
+        for part in response.parts:
+            if hasattr(part, 'text'):
+                text_parts.append(part.text)
+        return "".join(text_parts)
+    elif USE_OLLAMA:
         return response.get("message", {}).get("content", "")
     else:
         return response.output_text
@@ -147,7 +251,12 @@ def get_assistant_text(response: Any) -> str:
 
 def update_messages_with_response(messages: List[Dict[str, Any]], response: Any) -> None:
     """Update message history with LLM response."""
-    if USE_OLLAMA:
+    if USE_GEMINI:
+        # Add assistant message
+        content = get_assistant_text(response)
+        if content:
+            messages.append({"role": "assistant", "content": content})
+    elif USE_OLLAMA:
         # Add assistant message
         messages.append(response["message"])
     else:
@@ -157,7 +266,12 @@ def update_messages_with_response(messages: List[Dict[str, Any]], response: Any)
 
 def create_tool_result_message(call_id: str, tool_name: str, result: str) -> Dict[str, Any]:
     """Create a tool result message."""
-    if USE_OLLAMA:
+    if USE_GEMINI:
+        return {
+            "role": "tool",
+            "content": result,
+        }
+    elif USE_OLLAMA:
         return {
             "role": "tool",
             "content": result,
@@ -173,11 +287,12 @@ def create_tool_result_message(call_id: str, tool_name: str, result: str) -> Dic
 async def main():
     run_id = str(uuid.uuid4())
     print(f"[run_id] {run_id}")
-    print(f"[using] {'Ollama (' + MODEL + ')' if USE_OLLAMA else 'OpenAI (' + MODEL + ')'}")
+    backend = "gemini" if USE_GEMINI else ("ollama" if USE_OLLAMA else "openai")
+    print(f"[using] {backend.capitalize()} ({MODEL})")
     print(f"[paypal_dry_run] {PAYPAL_DRY_RUN} (set PAYPAL_ACCESS_TOKEN to disable dry-run)\n")
 
     user_prompt = input("User prompt> ").strip()
-    log_event({"type": "run_start", "run_id": run_id, "model": MODEL, "fs_root": FS_ROOT, "backend": "ollama" if USE_OLLAMA else "openai"})
+    log_event({"type": "run_start", "run_id": run_id, "model": MODEL, "fs_root": FS_ROOT, "backend": backend})
     log_event({"type": "user_prompt", "run_id": run_id, "prompt": user_prompt})
 
     # Start MCP servers (stdio)
@@ -316,7 +431,11 @@ async def main():
                     return
 
                 for call in calls:
-                    if USE_OLLAMA:
+                    if USE_GEMINI:
+                        call_id = None
+                        call_name = call.name
+                        call_args = dict(call.args)
+                    elif USE_OLLAMA:
                         call_id = None  # Ollama doesn't use call_id
                         call_name = call["function"]["name"]
                         call_args = call["function"]["arguments"]
