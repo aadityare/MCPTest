@@ -8,7 +8,18 @@ import uuid
 import urllib.parse
 from typing import Any, Dict, List
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -28,9 +39,28 @@ PAYPAL_ACCESS_TOKEN = os.environ.get("PAYPAL_ACCESS_TOKEN", "")  # leave empty i
 
 # If no token, we still log the request but we skip calling PayPal MCP (dry-run).
 PAYPAL_DRY_RUN = (PAYPAL_ACCESS_TOKEN.strip() == "")
+
+# Ollama fallback settings
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 # -----------------------------
 
-client = OpenAI()
+# Determine which client to use
+USE_OLLAMA = False
+client = None
+
+if not OPENAI_AVAILABLE or not os.environ.get("OPENAI_API_KEY"):
+    if OLLAMA_AVAILABLE:
+        USE_OLLAMA = True
+        MODEL = OLLAMA_MODEL
+        print(f"[INFO] Using Ollama with model: {MODEL}")
+    else:
+        print("Error: Neither OpenAI nor Ollama is available.")
+        print("Install one: pip install openai  OR  pip install ollama")
+        sys.exit(1)
+else:
+    client = OpenAI()
+    print(f"[INFO] Using OpenAI with model: {MODEL}")
 
 
 def log_event(event: Dict[str, Any]):
@@ -64,13 +94,90 @@ def extract_urls(text: str, limit: int = 10) -> List[str]:
     return out
 
 
+def call_llm_with_tools(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Any:
+    """Call LLM (OpenAI or Ollama) with tool support."""
+    if USE_OLLAMA:
+        # Convert OpenAI tool format to Ollama format
+        ollama_tools = []
+        for tool in tools:
+            ollama_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"]
+                }
+            })
+        
+        response = ollama.chat(
+            model=MODEL,
+            messages=messages,
+            tools=ollama_tools,
+        )
+        return response
+    else:
+        # OpenAI
+        resp = client.responses.create(
+            model=MODEL,
+            input=messages,
+            tools=tools,
+        )
+        return resp
+
+
+def extract_tool_calls(response: Any) -> List[Any]:
+    """Extract tool calls from LLM response (works for both OpenAI and Ollama)."""
+    if USE_OLLAMA:
+        # Ollama format
+        message = response.get("message", {})
+        tool_calls = message.get("tool_calls", [])
+        return tool_calls if tool_calls else []
+    else:
+        # OpenAI format
+        return [o for o in response.output if getattr(o, "type", None) == "function_call"]
+
+
+def get_assistant_text(response: Any) -> str:
+    """Get assistant text from response."""
+    if USE_OLLAMA:
+        return response.get("message", {}).get("content", "")
+    else:
+        return response.output_text
+
+
+def update_messages_with_response(messages: List[Dict[str, Any]], response: Any) -> None:
+    """Update message history with LLM response."""
+    if USE_OLLAMA:
+        # Add assistant message
+        messages.append(response["message"])
+    else:
+        # OpenAI format
+        messages += response.output
+
+
+def create_tool_result_message(call_id: str, tool_name: str, result: str) -> Dict[str, Any]:
+    """Create a tool result message."""
+    if USE_OLLAMA:
+        return {
+            "role": "tool",
+            "content": result,
+        }
+    else:
+        return {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": result,
+        }
+
+
 async def main():
     run_id = str(uuid.uuid4())
     print(f"[run_id] {run_id}")
+    print(f"[using] {'Ollama (' + MODEL + ')' if USE_OLLAMA else 'OpenAI (' + MODEL + ')'}")
     print(f"[paypal_dry_run] {PAYPAL_DRY_RUN} (set PAYPAL_ACCESS_TOKEN to disable dry-run)\n")
 
     user_prompt = input("User prompt> ").strip()
-    log_event({"type": "run_start", "run_id": run_id, "model": MODEL, "fs_root": FS_ROOT})
+    log_event({"type": "run_start", "run_id": run_id, "model": MODEL, "fs_root": FS_ROOT, "backend": "ollama" if USE_OLLAMA else "openai"})
     log_event({"type": "user_prompt", "run_id": run_id, "prompt": user_prompt})
 
     # Start MCP servers (stdio)
@@ -87,7 +194,7 @@ async def main():
     )
 
     # PayPal MCP via npx (official)
-    # PayPal docs show: npx -y @paypal/mcp --tools=all + env PAYPAL_ACCESS_TOKEN, PAYPAL_ENVIRONMENT. :contentReference[oaicite:4]{index=4}
+    # PayPal docs show: npx -y @paypal/mcp --tools=all + env PAYPAL_ACCESS_TOKEN, PAYPAL_ENVIRONMENT.
     paypal_env = os.environ.copy()
     paypal_env["PAYPAL_ENVIRONMENT"] = PAYPAL_ENVIRONMENT
     if PAYPAL_ACCESS_TOKEN.strip():
@@ -195,49 +302,60 @@ async def main():
                     break
 
             for step in range(12):
-                resp = client.responses.create(model=MODEL, input=messages, tools=tools)
-                messages += resp.output
+                response = call_llm_with_tools(messages, tools)
+                
+                update_messages_with_response(messages, response)
 
-                calls = [o for o in resp.output if getattr(o, "type", None) == "function_call"]
+                calls = extract_tool_calls(response)
+                
                 if not calls:
-                    log_event({"type": "assistant_reply", "run_id": run_id, "text": resp.output_text})
-                    print("\nAssistant>\n" + resp.output_text)
+                    assistant_text = get_assistant_text(response)
+                    log_event({"type": "assistant_reply", "run_id": run_id, "text": assistant_text})
+                    print("\nAssistant>\n" + assistant_text)
                     log_event({"type": "run_end", "run_id": run_id})
                     return
 
                 for call in calls:
-                    args = json.loads(call.arguments or "{}")
-                    log_event({"type": "llm_tool_call", "run_id": run_id, "step": step, "tool": call.name, "arguments": args})
+                    if USE_OLLAMA:
+                        call_id = None  # Ollama doesn't use call_id
+                        call_name = call["function"]["name"]
+                        call_args = call["function"]["arguments"]
+                    else:
+                        call_id = call.call_id
+                        call_name = call.name
+                        call_args = json.loads(call.arguments or "{}")
 
-                    if call.name == "filesystem_read_text_file":
-                        log_event({"type": "mcp_request", "run_id": run_id, "server": "filesystem", "tool": "read_text_file", "arguments": args})
-                        r = await fs.call_tool("read_text_file", args)
+                    log_event({"type": "llm_tool_call", "run_id": run_id, "step": step, "tool": call_name, "arguments": call_args})
+
+                    if call_name == "filesystem_read_text_file":
+                        log_event({"type": "mcp_request", "run_id": run_id, "server": "filesystem", "tool": "read_text_file", "arguments": call_args})
+                        r = await fs.call_tool("read_text_file", call_args)
                         out = mcp_text(r)
                         log_event({"type": "mcp_response", "run_id": run_id, "server": "filesystem", "tool": "read_text_file", "response": out})
 
-                    elif call.name == "filesystem_search_files":
-                        log_event({"type": "mcp_request", "run_id": run_id, "server": "filesystem", "tool": "search_files", "arguments": args})
-                        r = await fs.call_tool("search_files", args)
+                    elif call_name == "filesystem_search_files":
+                        log_event({"type": "mcp_request", "run_id": run_id, "server": "filesystem", "tool": "search_files", "arguments": call_args})
+                        r = await fs.call_tool("search_files", call_args)
                         out = mcp_text(r)
                         log_event({"type": "mcp_response", "run_id": run_id, "server": "filesystem", "tool": "search_files", "response": out})
 
-                    elif call.name == "fetch_fetch":
-                        log_event({"type": "mcp_request", "run_id": run_id, "server": "fetch", "tool": fx_tool_name, "arguments": args})
-                        r = await fx.call_tool(fx_tool_name, {"url": args["url"]})
+                    elif call_name == "fetch_fetch":
+                        log_event({"type": "mcp_request", "run_id": run_id, "server": "fetch", "tool": fx_tool_name, "arguments": call_args})
+                        r = await fx.call_tool(fx_tool_name, {"url": call_args["url"]})
                         page = mcp_text(r)
-                        out = json.dumps({"fetched_url": args["url"], "extracted_urls": extract_urls(page)}, indent=2)
+                        out = json.dumps({"fetched_url": call_args["url"], "extracted_urls": extract_urls(page)}, indent=2)
                         log_event({"type": "mcp_response", "run_id": run_id, "server": "fetch", "tool": fx_tool_name, "response": out})
 
-                    elif call.name == "paypal_send_salary":
+                    elif call_name == "paypal_send_salary":
                         # This is the exact payload you care about.
-                        log_event({"type": "mcp_request", "run_id": run_id, "server": "paypal", "tool": "SEND_SALARY", "arguments": args})
+                        log_event({"type": "mcp_request", "run_id": run_id, "server": "paypal", "tool": "SEND_SALARY", "arguments": call_args})
 
                         if PAYPAL_DRY_RUN or not paypal_send_tool:
                             out = "[paypal_dry_run_or_tool_missing] Logged payload only (no API call)."
                         else:
                             try:
                                 # Forward to the real PayPal MCP tool (name depends on server)
-                                r = await paypal.call_tool(paypal_send_tool, args)
+                                r = await paypal.call_tool(paypal_send_tool, call_args)
                                 out = mcp_text(r)
                             except Exception as e:
                                 out = f"[paypal_call_failed] {repr(e)}"
@@ -247,9 +365,8 @@ async def main():
                     else:
                         out = "Unknown tool"
 
-                    messages.append({"type": "function_call_output", "call_id": call.call_id, "output": out})
+                    messages.append(create_tool_result_message(call_id, call_name, out))
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
