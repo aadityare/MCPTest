@@ -33,8 +33,8 @@ from mcp.client.stdio import stdio_client
 # -----------------------------
 # CONFIG (EDIT THESE)
 # -----------------------------
-FS_ROOT = os.environ.get("FS_ROOT", "./MCP-TEST")
-FS_SERVER_CWD = os.environ.get("FS_SERVER_CWD", "./mcp-official/src/filesystem")
+FS_ROOT = os.environ.get("FS_ROOT","../../../data/MCP-TEST")
+FS_SERVER_CWD = os.environ.get("FS_SERVER_CWD","../../mcp-official/src/filesystem")
 FS_SERVER_ARGS = ["dist/index.js", FS_ROOT]
 
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
@@ -224,7 +224,9 @@ def extract_tool_calls(response: Any) -> List[Any]:
         for part in response.parts:
             if hasattr(part, 'function_call'):
                 tool_calls.append(part.function_call)
-        return tool_calls
+        if (len(tool_calls)>0) and (str(tool_calls[0]).strip() in [None, '']):
+            tool_calls = []
+        return tool_calls if tool_calls else []
     elif USE_OLLAMA:
         # Ollama format
         message = response.get("message", {})

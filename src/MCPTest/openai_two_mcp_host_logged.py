@@ -34,8 +34,8 @@ from mcp.client.stdio import stdio_client
 # ============================================================
 # CONFIG (EDIT THESE)
 # ============================================================
-FS_ROOT = "../../../MCP-TEST"
-FS_SERVER_CWD = "./mcp-official/src/filesystem"
+FS_ROOT = os.environ.get("FS_ROOT","../../../data/MCP-TEST")
+FS_SERVER_CWD = os.environ.get("FS_SERVER_CWD","../../mcp-official/src/filesystem")
 FS_SERVER_ARGS = ["dist/index.js", FS_ROOT]
 
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
